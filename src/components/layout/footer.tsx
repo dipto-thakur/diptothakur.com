@@ -101,7 +101,7 @@ export function Footer() {
                 dark:text-zinc-400
               "
             >
-              {siteConfig.role}
+              {siteConfig.availability}
             </p>
 
             <p
