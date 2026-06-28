@@ -94,12 +94,12 @@ export function Footer() {
                     <li key={link.label}>
                       <a
                         href={link.href}
-                        target={link.external ? '_blank' : undefined}
-                        rel={link.external ? 'noopener noreferrer' : undefined}
+                        target={(link as any).external ? '_blank' : undefined}
+                        rel={(link as any).external ? 'noopener noreferrer' : undefined}
                         className="group inline-flex items-center gap-1 text-[13px] text-zinc-500 transition-colors duration-150 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-100"
                       >
                         {link.label}
-                        {link.external && (
+                        {(link as any).external && (
                           <FiArrowUpRight
                             size={11}
                             className="opacity-0 transition-all duration-200 group-hover:-translate-y-px group-hover:translate-x-px group-hover:opacity-60"
