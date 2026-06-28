@@ -114,3 +114,22 @@ export interface NavItem {
   label: string;
   href: string;
 }
+export interface GridConfig {
+  cellSize: number;
+  gap: number;
+
+  cols: number;
+  rows: number;
+
+  width: number;
+  height: number;
+
+  gridWidth: number;
+  gridHeight: number;
+
+  offsetX: number;
+  offsetY: number;
+
+  step: number;
+  dpr: number;
+}

@@ -1,0 +1,415 @@
+'use client';
+
+import { useEffect, useRef, useCallback } from 'react';
+import { cn } from '@/lib/utils';
+
+/* ── Constants ───────────────────────────────────────────────────── */
+const GAP              = 2;       // px between cells
+const ALPHA_THRESHOLD  = 28;      // 0-255 — ink presence cutoff
+const SAMPLE_DENSITY   = 3;       // sub-pixel samples per cell axis (3×3 = 9)
+const SHIMMER_PERIOD   = 18000;   // ms for one sweep across grid
+const SHIMMER_WIDTH    = 6;       // cells wide
+const RIPPLE_MS        = 280;
+const REVEAL_MS        = 700;
+const HOLD_MS          = 1400;
+const DISSOLVE_MS      = 500;
+const BASE_CELL_ALPHA  = 0.055;   // resting grid pixel opacity
+
+/* ── Cell size by viewport ───────────────────────────────────────── */
+function getCellSize(containerW: number): number {
+  if (containerW < 480) return 6;
+  if (containerW < 768) return 8;
+  return 11;
+}
+
+/* ── Flat typed-array grid ───────────────────────────────────────── */
+// Per cell: [isText(0|1), revealDelay(ms), noiseAlpha(0-1)]
+// Runtime alpha computed per-frame — no per-cell object allocation.
+
+/* ── Easing ──────────────────────────────────────────────────────── */
+const easeOutExpo = (t: number) => t >= 1 ? 1 : 1 - 2 ** (-10 * t);
+const easeInExpo  = (t: number) => t <= 0 ? 0 : 2 ** (10 * t - 10);
+const easeInOutQuart = (t: number) =>
+  t < 0.5 ? 8 * t ** 4 : 1 - (-2 * t + 2) ** 4 / 2;
+
+/* ── Offscreen text sampler ──────────────────────────────────────── */
+function sampleTextMap(
+  text: string,
+  cols: number,
+  rows: number,
+  cellSize: number,
+): Uint8Array {
+  const step  = cellSize + GAP;
+  const pw    = cols * step;
+  const ph    = rows * step;
+
+  const oc  = document.createElement('canvas');
+  oc.width  = pw;
+  oc.height = ph;
+  const ctx = oc.getContext('2d', { willReadFrequently: true })!;
+
+  // Clear
+  ctx.clearRect(0, 0, pw, ph);
+
+  // Binary search for the largest font size that fits within 70% of height
+  // and 90% of width, ensuring no clipping.
+  let lo = 4, hi = ph * 0.8, bestSize = lo;
+  while (lo <= hi) {
+    const mid = Math.floor((lo + hi) / 2);
+    ctx.font = `600 ${mid}px ui-sans-serif, "Geist", "Inter", sans-serif`;
+    const metrics = ctx.measureText(text);
+    const tw = metrics.width;
+    const th = mid; // cap height approx
+    if (tw <= pw * 0.88 && th <= ph * 0.70) {
+      bestSize = mid;
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+
+  ctx.font         = `600 ${bestSize}px ui-sans-serif, "Geist", "Inter", sans-serif`;
+  ctx.fillStyle    = '#fff';
+  ctx.textBaseline = 'middle';
+  ctx.textAlign    = 'center';
+  ctx.fillText(text, pw / 2, ph / 2);
+
+  const imageData = ctx.getImageData(0, 0, pw, ph);
+  const pixels    = imageData.data;
+
+  const map = new Uint8Array(rows * cols);
+
+  for (let row = 0; row < rows; row++) {
+    for (let col = 0; col < cols; col++) {
+      // Multi-sample: average SAMPLE_DENSITY² points inside the cell
+      let sum = 0;
+      const x0 = col * step;
+      const y0 = row * step;
+      for (let sy = 0; sy < SAMPLE_DENSITY; sy++) {
+        for (let sx = 0; sx < SAMPLE_DENSITY; sx++) {
+          const px = Math.min(pw - 1, Math.floor(x0 + (sx + 0.5) * (cellSize / SAMPLE_DENSITY)));
+          const py = Math.min(ph - 1, Math.floor(y0 + (sy + 0.5) * (cellSize / SAMPLE_DENSITY)));
+          sum += pixels[(py * pw + px) * 4 + 3];
+        }
+      }
+      const avg = sum / (SAMPLE_DENSITY * SAMPLE_DENSITY);
+      map[row * cols + col] = avg > ALPHA_THRESHOLD ? 1 : 0;
+    }
+  }
+
+  return map;
+}
+
+/* ── Deterministic per-cell noise ────────────────────────────────── */
+function cellNoise(row: number, col: number): number {
+  const h = Math.sin(row * 127.1 + col * 311.7) * 43758.5453123;
+  return h - Math.floor(h); // 0..1
+}
+
+/* ── Props ───────────────────────────────────────────────────────── */
+interface PixelCanvasProps {
+  text?:     string;
+  className?: string;
+}
+
+/* ── Component ───────────────────────────────────────────────────── */
+export function PixelCanvas({
+  text      = 'DIPTO THAKUR',
+  className,
+}: PixelCanvasProps) {
+  const wrapRef   = useRef<HTMLDivElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const raf       = useRef(0);
+
+  /* Grid state — flat typed arrays, no per-frame GC pressure */
+  const cols       = useRef(0);
+  const rows       = useRef(0);
+  const cs         = useRef(11);   // cellSize
+  const step       = useRef(13);   // cs + GAP
+  const W          = useRef(0);
+  const H          = useRef(0);
+  const textMap    = useRef(new Uint8Array(0));
+  const noiseMap   = useRef(new Float32Array(0));
+  const delayMap   = useRef(new Float32Array(0)); // reveal delay per cell
+
+  /* Animation state */
+  const phase      = useRef<'idle'|'ripple'|'reveal'|'hold'|'dissolve'>('idle');
+  const phaseTs    = useRef(0);
+  const startTs    = useRef(0);
+
+  /* Mouse */
+  const mx   = useRef(-9999);
+  const my   = useRef(-9999);
+  const mvx  = useRef(0);
+  const mvy  = useRef(0);
+  const mIn  = useRef(false);
+  const lastX = useRef(-9999);
+  const lastY = useRef(-9999);
+  const lastT = useRef(0);
+
+  /* ── Build grid from container size ─────────────────────────── */
+  const build = useCallback(() => {
+    const wrap   = wrapRef.current;
+    const canvas = canvasRef.current;
+    if (!wrap || !canvas) return;
+
+    const cw = wrap.clientWidth;
+    const ch = wrap.clientHeight || 180;
+
+    const cellSize = getCellSize(cw);
+    const sp       = cellSize + GAP;
+    const c        = Math.floor(cw / sp);
+    const r        = Math.floor(ch / sp);
+
+    cs.current   = cellSize;
+    step.current = sp;
+    cols.current = c;
+    rows.current = r;
+    W.current    = cw;
+    H.current    = ch;
+
+    // Stretch canvas to exactly fill wrapper
+    canvas.width  = cw;
+    canvas.height = ch;
+
+    // Text map
+    textMap.current = sampleTextMap(text, c, r, cellSize);
+
+    // Noise map — computed once, stable across frames
+    const noise = new Float32Array(r * c);
+    for (let i = 0; i < r; i++)
+      for (let j = 0; j < c; j++)
+        noise[i * c + j] = cellNoise(i, j);
+    noiseMap.current = noise;
+    delayMap.current = new Float32Array(r * c);
+  }, [text]);
+
+  /* ── Main render loop ───────────────────────────────────────── */
+  const render = useCallback((ts: number) => {
+    const canvas = canvasRef.current;
+    if (!canvas) { raf.current = requestAnimationFrame(render); return; }
+    const ctx = canvas.getContext('2d');
+    if (!ctx) { raf.current = requestAnimationFrame(render); return; }
+
+    if (!startTs.current) startTs.current = ts;
+
+    const c   = cols.current;
+    const r   = rows.current;
+    const cs_ = cs.current;
+    const sp  = step.current;
+    const cw  = W.current;
+    const ch  = H.current;
+    const tm  = textMap.current;
+    const nm  = noiseMap.current;
+    const dm  = delayMap.current;
+
+    // ── Phase transitions ──────────────────────────────────────
+    const ph = phase.current;
+
+    if (ph === 'idle' && mIn.current) {
+      phase.current  = 'ripple';
+      phaseTs.current = ts;
+    }
+    if (ph === 'ripple' && ts - phaseTs.current >= RIPPLE_MS) {
+      phase.current   = 'reveal';
+      phaseTs.current = ts;
+      // Pre-compute reveal delays: distance from cursor, clamped 0–400ms
+      for (let row = 0; row < r; row++) {
+        for (let col = 0; col < c; col++) {
+          const cx  = col * sp + cs_ * 0.5;
+          const cy  = row * sp + cs_ * 0.5;
+          const dx  = cx - mx.current;
+          const dy  = cy - my.current;
+          const d   = Math.sqrt(dx * dx + dy * dy);
+          dm[row * c + col] = Math.min(d / cw, 1) * 380;
+        }
+      }
+    }
+    if (ph === 'reveal' && ts - phaseTs.current >= REVEAL_MS + 420) {
+      phase.current   = 'hold';
+      phaseTs.current = ts;
+    }
+    if (ph === 'hold' && (!mIn.current || ts - phaseTs.current >= HOLD_MS)) {
+      phase.current   = 'dissolve';
+      phaseTs.current = ts;
+    }
+    if (ph === 'dissolve' && ts - phaseTs.current >= DISSOLVE_MS) {
+      phase.current   = 'idle';
+      phaseTs.current = ts;
+    }
+
+    // ── Shimmer band position (col index) ──────────────────────
+    const shimmerT   = (ts % SHIMMER_PERIOD) / SHIMMER_PERIOD;
+    const shimmerCol = shimmerT * (c + SHIMMER_WIDTH * 2) - SHIMMER_WIDTH;
+
+    // ── Clear ──────────────────────────────────────────────────
+    ctx.clearRect(0, 0, cw, ch);
+
+    // ── Draw cells ────────────────────────────────────────────
+    const curPhase = phase.current;
+    const pTs      = phaseTs.current;
+
+    for (let row = 0; row < r; row++) {
+      for (let col = 0; col < c; col++) {
+        const idx    = row * c + col;
+        const isText = tm[idx] === 1;
+        const noise  = nm[idx];
+
+        const cx = col * sp + cs_ * 0.5;
+        const cy = row * sp + cs_ * 0.5;
+
+        // Cursor distance & velocity
+        const dx    = cx - mx.current;
+        const dy    = cy - my.current;
+        const dist  = Math.sqrt(dx * dx + dy * dy);
+        const speed = Math.sqrt(mvx.current ** 2 + mvy.current ** 2);
+        const rr    = 55 + speed * 1.6;
+        const prox  = Math.max(0, 1 - dist / rr);
+
+        // Shimmer contribution — diagonal band
+        const sd  = Math.abs(col - shimmerCol);
+        const shim = sd < SHIMMER_WIDTH
+          ? (1 - sd / SHIMMER_WIDTH) * 0.07 * (0.5 + 0.5 * Math.sin(ts / 400 + row * 0.5))
+          : 0;
+
+        // Base idle alpha — sparse, organic
+        const idleAlpha = BASE_CELL_ALPHA * (noise < 0.1 ? noise * 8 : noise * 0.4) + shim;
+
+        let alpha  = 0;
+        let radius = 2.5;
+        let lift   = 0;
+
+        if (curPhase === 'idle') {
+          alpha  = idleAlpha + prox * 0.06;
+          radius = 2.5;
+
+        } else if (curPhase === 'ripple') {
+          const t    = Math.min(1, (ts - pTs) / RIPPLE_MS);
+          const wave = Math.max(0, 1 - dist / (rr * 3));
+          alpha      = idleAlpha + wave * 0.22 * easeOutExpo(t);
+          radius     = 2.5 + wave * 0.8;
+
+        } else if (curPhase === 'reveal') {
+          const elapsed_ = ts - pTs;
+          const delay    = dm[idx];
+          const t        = Math.max(0, Math.min(1, (elapsed_ - delay) / REVEAL_MS));
+          const eased    = easeOutExpo(t);
+
+          if (isText) {
+            alpha  = eased * 0.90;
+            radius = 2.5 + eased * 2;
+            lift   = eased * 1.2;
+          } else {
+            alpha  = idleAlpha * (1 - eased * 0.6);
+          }
+
+        } else if (curPhase === 'hold') {
+          if (isText) {
+            const pulse = 0.05 * Math.sin(ts / 900 + col * 0.4 + row * 0.2);
+            alpha  = 0.86 + pulse;
+            radius = 4;
+            lift   = 1.2;
+          } else {
+            alpha  = idleAlpha * 0.45 + shim;
+          }
+
+        } else if (curPhase === 'dissolve') {
+          const t = Math.min(1, (ts - pTs) / DISSOLVE_MS);
+
+          if (isText) {
+            // Per-cell stagger via noise so it breaks apart organically
+            const stagger = noise * 0.5;
+            const ct      = Math.min(1, Math.max(0, (t - stagger * 0.4) / (1 - stagger * 0.4)));
+            const eased   = easeInExpo(ct);
+            alpha  = 0.86 * (1 - eased);
+            lift   = 1.2 - eased * 2.5;
+            radius = 4;
+          } else {
+            alpha  = idleAlpha * 0.45 * (1 - t * 0.6) + shim;
+          }
+        }
+
+        // Clamp
+        alpha = Math.max(0, Math.min(1, alpha));
+        if (alpha < 0.008) continue;
+
+        // Draw — monochrome white on dark bg
+        ctx.save();
+        if (lift !== 0) ctx.translate(0, -lift);
+        ctx.fillStyle = `rgba(255,255,255,${alpha.toFixed(3)})`;
+        rRect(ctx, col * sp, row * sp, cs_, cs_, Math.max(2, radius));
+        ctx.fill();
+        ctx.restore();
+      }
+    }
+
+    raf.current = requestAnimationFrame(render);
+  }, []);
+
+  /* ── Resize observer ─────────────────────────────────────────── */
+  useEffect(() => {
+    const wrap = wrapRef.current;
+    if (!wrap) return;
+
+    build();
+    raf.current = requestAnimationFrame(render);
+
+    const ro = new ResizeObserver(() => {
+      cancelAnimationFrame(raf.current);
+      build();
+      raf.current = requestAnimationFrame(render);
+    });
+    ro.observe(wrap);
+
+    return () => { ro.disconnect(); cancelAnimationFrame(raf.current); };
+  }, [build, render]);
+
+  /* ── Pointer events ──────────────────────────────────────────── */
+  const onMove = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
+    const rect = wrapRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const nx  = e.clientX - rect.left;
+    const ny  = e.clientY - rect.top;
+    const now = performance.now();
+    const dt  = Math.max(1, now - lastT.current);
+    mvx.current = (nx - lastX.current) / dt * 16;
+    mvy.current = (ny - lastY.current) / dt * 16;
+    mx.current  = nx;
+    my.current  = ny;
+    mIn.current = true;
+    lastX.current = nx; lastY.current = ny; lastT.current = now;
+  }, []);
+
+  const onLeave = useCallback(() => {
+    mIn.current  = false;
+    mvx.current  = 0;
+    mvy.current  = 0;
+  }, []);
+
+  return (
+    <div
+      ref={wrapRef}
+      onMouseMove={onMove}
+      onMouseLeave={onLeave}
+      className={cn('relative w-full cursor-crosshair overflow-hidden', className)}
+      aria-hidden="true"
+    >
+      <canvas ref={canvasRef} className="block w-full h-full" />
+    </div>
+  );
+}
+
+/* ── Rounded rect helper ─────────────────────────────────────────── */
+function rRect(
+  ctx: CanvasRenderingContext2D,
+  x: number, y: number, w: number, h: number, r: number,
+) {
+  const r2 = Math.min(r, w / 2, h / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + r2, y);
+  ctx.arcTo(x + w, y,     x + w, y + h, r2);
+  ctx.arcTo(x + w, y + h, x,     y + h, r2);
+  ctx.arcTo(x,     y + h, x,     y,     r2);
+  ctx.arcTo(x,     y,     x + w, y,     r2);
+  ctx.closePath();
+}

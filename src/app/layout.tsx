@@ -4,6 +4,7 @@ import { Footer } from '@/components/layout/footer';
 import { siteConfig } from '@/config/site';
 import './globals.css';
 import { ScrollToTop } from "@/components/ui/scroll-to-top";
+import Script from "next/script";
 
 
 /* ── Viewport ─────────────────────────────────────────────────────── */
@@ -80,6 +81,15 @@ export default function RootLayout({
 }: Readonly<{ children: React.ReactNode }>) {
   return (
     <html lang="en" suppressHydrationWarning>
+      <head>
+        <script defer src="https://cloud.umami.is/script.js" data-website-id="a7bbe39c-5b6a-4da0-8770-b1f71599378a"></script>
+              <Script
+                defer
+                data-domain="diptothakur.vercel.app"
+                src="https://plausible.io/js/script.js"
+                strategy="afterInteractive"
+              />
+        </head>
       <body className="min-h-screen bg-white font-sans text-zinc-900 antialiased dark:bg-zinc-950 dark:text-zinc-100">
 
         {/* Skip to content */}

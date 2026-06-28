@@ -15,11 +15,9 @@ interface ProjectCardProps {
   project: Project;
   variant?: "default" | "compact";
   className?: string;
+  isLast?: boolean;
 }
-
-/* -------------------------------------------------------------------------- */
 /* Status                                                                      */
-/* -------------------------------------------------------------------------- */
 
 const statusConfig: Record<
   Project["status"],
@@ -74,14 +72,13 @@ function StatusDot({
   );
 }
 
-/* -------------------------------------------------------------------------- */
 /* Component                                                                    */
-/* -------------------------------------------------------------------------- */
 
 export function ProjectCard({
   project,
   variant = "default",
   className,
+  isLast = false,
 }: ProjectCardProps) {
   const githubLink = project.externalLinks.find(
     (link) => link.type === "github"
@@ -91,9 +88,7 @@ export function ProjectCard({
     (link) => link.type === "live"
   );
 
-  /* ------------------------------------------------------------------------ */
   /* Compact Variant                                                          */
-  /* ------------------------------------------------------------------------ */
 
   if (variant === "compact") {
     return (
@@ -218,9 +213,7 @@ export function ProjectCard({
     );
   }
 
-  /* ------------------------------------------------------------------------ */
   /* Default Variant (Part 2)                                                 */
-  /* ------------------------------------------------------------------------ */
 
   return (
     <article
@@ -230,21 +223,38 @@ export function ProjectCard({
       )}
     >
       <div className="flex flex-col gap-6 md:flex-row md:items-start md:justify-between">
-        {/* ------------------------------------------------------------------ */}
         {/* Left                                                               */}
-        {/* ------------------------------------------------------------------ */}
-
         <div className="flex min-w-0 flex-1 items-start gap-4">
-          {project.logo && (
-            <Image
-              src={project.logo}
-              alt={`${project.title} logo`}
-              width={44}
-              height={44}
-              className="mt-1 h-11 w-11 rounded-xl object-contain"
-            />
-          )}
+          {/* Timeline column */}
+          <div className="flex flex-col items-center self-stretch">
+            {project.logo && (
+              <Image
+                src={project.logo}
+                alt={`${project.title} logo`}
+                width={44}
+                height={44}
+                className="mt-1 h-11 w-11 rounded-xl object-contain"
+              />
+            )}
 
+            {!isLast && (
+              <div
+                className="
+          mt-3
+          w-px
+          flex-1
+          bg-zinc-200/80
+          transition-colors
+          duration-200
+          group-hover:bg-zinc-300
+          dark:bg-zinc-800/80
+          dark:group-hover:bg-zinc-700
+        "
+              />
+            )}
+          </div>
+
+          {/* Content */}
           <div className="min-w-0 flex-1">
             {/* Metadata */}
 
@@ -271,8 +281,8 @@ export function ProjectCard({
               showExternalIcon={false}
               className="mt-2 inline-flex items-center gap-2"
             >
-                <span
-                  className="
+              <span
+                className="
                     text-[1.45rem]
                     font-semibold
                     leading-tight
@@ -282,9 +292,9 @@ export function ProjectCard({
                     duration-200
                     dark:text-zinc-100
                   "
-                >
-                  {project.title}
-                </span>
+              >
+                {project.title}
+              </span>
 
               <FiArrowUpRight
                 size={16}
